@@ -1,0 +1,15 @@
+[package]
+name = "cosmic-nightlight"
+version = "0.1.0"
+edition = "2024"
+description = "Hardware-gamma night light for the COSMIC desktop (wlr-gamma-control client + cosmic-comp patch)"
+license = "GPL-3.0-only"
+repository = "https://github.com/jasonrsmith/cosmic-nightlight"
+readme = "README.md"
+
+[dependencies]
+calloop = { version = "0.14.5", features = ["signals"] }
+calloop-wayland-source = "0.4.1"
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["calloop"] }
+wayland-client = "0.31.15"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }

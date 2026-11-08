@@ -1,0 +1,566 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 829ba94e..66055575 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -78,6 +78,7 @@ xkbcommon = "0.9"
+ zbus = "5.14.0"
+ profiling = { version = "1.0" }
+ rustix = { version = "1.1.4", features = ["process"] }
++drm-ffi = "0.9.1"
+ rand = "0.10"
+ # CLI arguments
+ clap_lex = "1.0"
+diff --git a/src/backend/kms/drm_helpers.rs b/src/backend/kms/drm_helpers.rs
+index 4e2b2a72..10071e53 100644
+--- a/src/backend/kms/drm_helpers.rs
++++ b/src/backend/kms/drm_helpers.rs
+@@ -348,6 +348,61 @@ pub fn clear_gamma(dev: &impl ControlDevice, crtc: crtc::Handle) -> Result<()> {
+         .map_err(Into::<anyhow::Error>::into)
+ }
+ 
++/// Number of entries per channel of the CRTC's `GAMMA_LUT`, if supported.
++pub fn gamma_lut_size(dev: &impl ControlDevice, crtc: crtc::Handle) -> Option<u32> {
++    get_prop(dev, crtc, "GAMMA_LUT").ok()?;
++    let (_, size) = get_property_val(dev, crtc, "GAMMA_LUT_SIZE").ok()?;
++    u32::try_from(size).ok().filter(|size| *size > 1)
++}
++
++/// Program the CRTC's `GAMMA_LUT` from a ramp laid out as
++/// `n` red, `n` green, then `n` blue entries (as in wlr-gamma-control).
++/// The ramp is resampled if `n` differs from the CRTC's `GAMMA_LUT_SIZE`.
++/// `None` restores the default (linear) gamma.
++pub fn set_gamma_lut(
++    dev: &impl ControlDevice,
++    crtc: crtc::Handle,
++    ramp: Option<&[u16]>,
++) -> Result<()> {
++    let Some(ramp) = ramp else {
++        return clear_gamma(dev, crtc);
++    };
++    let prop = get_prop(dev, crtc, "GAMMA_LUT")?;
++    let size = gamma_lut_size(dev, crtc).context("Crtc has no GAMMA_LUT_SIZE")? as usize;
++    let n = ramp.len() / 3;
++    anyhow::ensure!(n > 1 && ramp.len() == n * 3, "Invalid gamma ramp length");
++
++    let sample = |channel: usize, i: usize| -> u16 {
++        let ramp = &ramp[channel * n..(channel + 1) * n];
++        if size == n {
++            return ramp[i];
++        }
++        let pos = i as f64 * (n - 1) as f64 / (size - 1) as f64;
++        let lo = pos.floor() as usize;
++        let hi = (lo + 1).min(n - 1);
++        let t = pos - lo as f64;
++        (ramp[lo] as f64 * (1.0 - t) + ramp[hi] as f64 * t).round() as u16
++    };
++
++    // struct drm_color_lut { u16 red, green, blue, reserved; }
++    let mut blob = Vec::with_capacity(size * 8);
++    for i in 0..size {
++        for value in [sample(0, i), sample(1, i), sample(2, i), 0] {
++            blob.extend_from_slice(&value.to_ne_bytes());
++        }
++    }
++    let blob = drm_ffi::mode::create_property_blob(dev.as_fd(), &mut blob)
++        .context("Failed to create GAMMA_LUT blob")?;
++    let result = dev.set_property(
++        crtc,
++        prop,
++        property::Value::Blob(blob.blob_id as u64).into(),
++    );
++    // The CRTC state holds its own reference to the blob.
++    let _ = dev.destroy_property_blob(blob.blob_id as u64);
++    result.context("Failed to set GAMMA_LUT")
++}
++
+ pub fn panel_orientation(dev: &impl ControlDevice, conn: connector::Handle) -> Result<Transform> {
+     let (val_type, val) = get_property_val(dev, conn, "panel orientation")?;
+     match val_type.convert_value(val) {
+diff --git a/src/backend/kms/surface/mod.rs b/src/backend/kms/surface/mod.rs
+index cbc89381..10f7d733 100644
+--- a/src/backend/kms/surface/mod.rs
++++ b/src/backend/kms/surface/mod.rs
+@@ -146,6 +146,9 @@ pub struct SurfaceThreadState {
+     output: Output,
+     mirroring: Option<Output>,
+     screen_filter: ScreenFilter,
++    /// Gamma ramp set via wlr-gamma-control, re-applied on resume.
++    gamma: Option<Vec<u16>>,
++    gamma_pending: bool,
+     postprocess_textures: HashMap<DrmNode, PostprocessState>,
+ 
+     shell: Arc<parking_lot::RwLock<Shell>>,
+@@ -214,6 +217,8 @@ pub enum ThreadCommand {
+     },
+     UpdateMirroring(Option<Output>),
+     UpdateScreenFilter(ScreenFilter),
++    SetGamma(Option<Vec<u16>>),
++    GammaSize(SyncSender<Option<u32>>),
+     VBlank(Option<DrmEventMetadata>),
+     ScheduleRender,
+     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
+@@ -404,6 +409,20 @@ impl Surface {
+             .send(ThreadCommand::UpdateScreenFilter(config));
+     }
+ 
++    /// Size of the CRTC's gamma LUT, or `None` if unsupported or inactive.
++    pub fn gamma_size(&self) -> Option<u32> {
++        let (tx, rx) = std::sync::mpsc::sync_channel(1);
++        self.thread_command
++            .send(ThreadCommand::GammaSize(tx))
++            .ok()?;
++        rx.recv().ok().flatten()
++    }
++
++    /// Set (or with `None`, reset) the CRTC's gamma ramp.
++    pub fn set_gamma(&mut self, ramp: Option<Vec<u16>>) {
++        let _ = self.thread_command.send(ThreadCommand::SetGamma(ramp));
++    }
++
+     pub fn adaptive_sync_support(&self) -> Result<VrrSupport> {
+         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+         let _ = self
+@@ -545,6 +564,8 @@ fn surface_thread(
+         output,
+         mirroring: None,
+         screen_filter,
++        gamma: None,
++        gamma_pending: false,
+         postprocess_textures: HashMap::new(),
+ 
+         shell,
+@@ -600,6 +621,27 @@ fn surface_thread(
+             Event::Msg(ThreadCommand::UpdateScreenFilter(filter_config)) => {
+                 state.update_screen_filter(filter_config);
+             }
++            Event::Msg(ThreadCommand::SetGamma(ramp)) => {
++                let had_gamma = state.gamma.is_some();
++                state.gamma = ramp;
++                // Setting GAMMA_LUT is a blocking commit, so coalesce bursts
++                // (e.g. a client fading) and only apply the latest ramp.
++                if (state.gamma.is_some() || had_gamma) && !state.gamma_pending {
++                    state.gamma_pending = true;
++                    state.loop_handle.insert_idle(|state| {
++                        state.gamma_pending = false;
++                        state.apply_gamma();
++                    });
++                }
++            }
++            Event::Msg(ThreadCommand::GammaSize(result)) => {
++                let size = state.compositor.as_ref().and_then(|compositor| {
++                    compositor.with_compositor(|c| {
++                        drm_helpers::gamma_lut_size(c.surface(), c.surface().crtc())
++                    })
++                });
++                let _ = result.send(size);
++            }
+             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
+                 if let Some(compositor) = state.compositor.as_mut() {
+                     let _ = result.send(
+@@ -720,6 +762,22 @@ impl SurfaceThreadState {
+                 .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+         }
+         self.compositor = Some(compositor);
++        // Another DRM master may have changed the LUT while we were suspended.
++        if self.gamma.is_some() {
++            self.apply_gamma();
++        }
++    }
++
++    fn apply_gamma(&mut self) {
++        let Some(compositor) = self.compositor.as_ref() else {
++            return;
++        };
++        let ramp = self.gamma.as_deref();
++        if let Err(err) = compositor.with_compositor(|c| {
++            drm_helpers::set_gamma_lut(c.surface(), c.surface().crtc(), ramp)
++        }) {
++            warn!(?err, output = self.output.name(), "Failed to set gamma");
++        }
+     }
+ 
+     fn node_added(
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index ae6afd49..b0416ac8 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -1588,6 +1588,7 @@ impl Common {
+     }
+ 
+     pub fn remove_output(&mut self, output: &Output) {
++        self.gamma_control_state.output_removed(output);
+         let mut shell = self.shell.write();
+         let shell_ref = &mut *shell;
+         shell_ref.workspaces.remove_output(
+diff --git a/src/state.rs b/src/state.rs
+index e3d170b9..44b282df 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -22,6 +22,7 @@ use crate::{
+             keyboard_layout::KeyboardLayoutState,
+             output_configuration::OutputConfigurationState,
+             output_power::OutputPowerState,
++            gamma_control::GammaControlState,
+             overlap_notify::OverlapNotifyState,
+             session_lock_layer::SessionLockLayerState,
+             toplevel_info::ToplevelInfoState,
+@@ -284,6 +285,7 @@ pub struct Common {
+     pub output_state: OutputManagerState,
+     pub output_configuration_state: OutputConfigurationState<State>,
+     pub output_power_state: OutputPowerState,
++    pub gamma_control_state: GammaControlState,
+     pub presentation_state: PresentationState,
+     pub primary_selection_state: PrimarySelectionState,
+     pub ext_data_control_state: ExtDataControlState,
+@@ -678,6 +680,7 @@ impl State {
+         let output_configuration_state =
+             OutputConfigurationState::new(dh, handle.clone(), client_not_sandboxed);
+         let output_power_state = OutputPowerState::new::<Self, _>(dh, client_not_sandboxed);
++        let gamma_control_state = GammaControlState::new::<Self, _>(dh, client_not_sandboxed);
+         let overlap_notify_state =
+             OverlapNotifyState::new::<Self, _>(dh, client_has_no_security_context);
+         let presentation_state = PresentationState::new::<Self>(dh, clock.id() as u32);
+@@ -812,6 +815,7 @@ impl State {
+                 output_state,
+                 output_configuration_state,
+                 output_power_state,
++                gamma_control_state,
+                 overlap_notify_state,
+                 presentation_state,
+                 primary_selection_state,
+diff --git a/src/wayland/handlers/gamma_control.rs b/src/wayland/handlers/gamma_control.rs
+new file mode 100644
+index 00000000..ca357c8d
+--- /dev/null
++++ b/src/wayland/handlers/gamma_control.rs
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use smithay::output::Output;
++
++use crate::{
++    state::{BackendData, State},
++    utils::prelude::OutputExt,
++    wayland::protocols::gamma_control::{
++        GammaControlHandler, GammaControlState, delegate_gamma_control,
++    },
++};
++
++impl GammaControlHandler for State {
++    fn gamma_control_state(&mut self) -> &mut GammaControlState {
++        &mut self.common.gamma_control_state
++    }
++
++    fn gamma_size(&mut self, output: &Output) -> Option<u32> {
++        let BackendData::Kms(kms) = &mut self.backend else {
++            return None;
++        };
++        kms.drm_devices
++            .values_mut()
++            .flat_map(|device| device.inner.surfaces.values_mut())
++            .find(|surface| surface.output == *output)
++            .and_then(|surface| surface.gamma_size())
++    }
++
++    fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> bool {
++        let BackendData::Kms(kms) = &mut self.backend else {
++            return false;
++        };
++        let mut applied = false;
++        // Apply to the output itself and to any output mirroring it.
++        for surface in kms
++            .drm_devices
++            .values_mut()
++            .flat_map(|device| device.inner.surfaces.values_mut())
++            .filter(|surface| {
++                surface.output == *output || surface.output.mirroring().as_ref() == Some(output)
++            })
++        {
++            surface.set_gamma(ramp.clone());
++            applied = true;
++        }
++        applied
++    }
++}
++
++delegate_gamma_control!(State);
+diff --git a/src/wayland/handlers/mod.rs b/src/wayland/handlers/mod.rs
+index 3757dd8a..c1632f6f 100644
+--- a/src/wayland/handlers/mod.rs
++++ b/src/wayland/handlers/mod.rs
+@@ -25,6 +25,7 @@ pub mod layer_shell;
+ pub mod output;
+ pub mod output_configuration;
+ pub mod output_power;
++pub mod gamma_control;
+ pub mod overlap_notify;
+ pub mod pointer_constraints;
+ pub mod pointer_warp;
+diff --git a/src/wayland/protocols/gamma_control.rs b/src/wayland/protocols/gamma_control.rs
+new file mode 100644
+index 00000000..2bcb7ddc
+--- /dev/null
++++ b/src/wayland/protocols/gamma_control.rs
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! wlr-gamma-control-unstable-v1
++//!
++//! Lets a (non-sandboxed) client such as gammastep, wlsunset or a night-light
++//! daemon set the hardware gamma ramps (CRTC `GAMMA_LUT`) of an output.
++//! At most one client may control a given output at a time. When the
++//! controlling object is destroyed (or its client disconnects) the output's
++//! original gamma is restored.
++
++use smithay::{
++    output::{Output, WeakOutput},
++    reexports::{
++        wayland_protocols_wlr::gamma_control::v1::server::{
++            zwlr_gamma_control_manager_v1::{self, ZwlrGammaControlManagerV1},
++            zwlr_gamma_control_v1::{self, ZwlrGammaControlV1},
++        },
++        wayland_server::{
++            Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
++            backend::GlobalId,
++        },
++    },
++};
++use std::{fs::File, os::unix::fs::FileExt};
++use tracing::{debug, warn};
++use wayland_backend::server::ClientId;
++
++pub trait GammaControlHandler {
++    fn gamma_control_state(&mut self) -> &mut GammaControlState;
++    /// Number of entries per channel in the output's gamma ramp, or `None`
++    /// if the output does not support gamma tables.
++    fn gamma_size(&mut self, output: &Output) -> Option<u32>;
++    /// Apply gamma ramps (`size` red, then `size` green, then `size` blue
++    /// entries), or restore the default ramp with `None`.
++    /// Returns `false` if the ramp could not be applied.
++    fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> bool;
++}
++
++#[derive(Debug)]
++pub struct GammaControlState {
++    global: GlobalId,
++    /// Controls currently holding exclusive gamma access to an output.
++    active: Vec<ZwlrGammaControlV1>,
++}
++
++impl GammaControlState {
++    pub fn new<D, F>(dh: &DisplayHandle, client_filter: F) -> GammaControlState
++    where
++        D: GlobalDispatch<ZwlrGammaControlManagerV1, GammaControlManagerGlobalData> + 'static,
++        F: for<'a> Fn(&'a Client) -> bool + Send + Sync + 'static,
++    {
++        let global = dh.create_global::<D, ZwlrGammaControlManagerV1, _>(
++            1,
++            GammaControlManagerGlobalData {
++                filter: Box::new(client_filter),
++            },
++        );
++
++        GammaControlState {
++            global,
++            active: Vec::new(),
++        }
++    }
++
++    pub fn global_id(&self) -> GlobalId {
++        self.global.clone()
++    }
++
++    /// Invalidate gamma controls for outputs that no longer exist.
++    pub fn output_removed(&mut self, output: &Output) {
++        self.active.retain(|control| {
++            let data = control.data::<GammaControlData>().unwrap();
++            if data.output == *output {
++                control.failed();
++                false
++            } else {
++                true
++            }
++        });
++    }
++}
++
++pub struct GammaControlManagerGlobalData {
++    filter: Box<dyn for<'a> Fn(&'a Client) -> bool + Send + Sync>,
++}
++
++pub struct GammaControlData {
++    output: WeakOutput,
++    size: u32,
++}
++
++impl<D> GlobalDispatch<ZwlrGammaControlManagerV1, GammaControlManagerGlobalData, D>
++    for GammaControlState
++where
++    D: GlobalDispatch<ZwlrGammaControlManagerV1, GammaControlManagerGlobalData>
++        + Dispatch<ZwlrGammaControlManagerV1, ()>
++        + 'static,
++{
++    fn bind(
++        _state: &mut D,
++        _dh: &DisplayHandle,
++        _client: &Client,
++        resource: New<ZwlrGammaControlManagerV1>,
++        _global_data: &GammaControlManagerGlobalData,
++        data_init: &mut DataInit<'_, D>,
++    ) {
++        data_init.init(resource, ());
++    }
++
++    fn can_view(client: Client, global_data: &GammaControlManagerGlobalData) -> bool {
++        (global_data.filter)(&client)
++    }
++}
++
++impl<D> Dispatch<ZwlrGammaControlManagerV1, (), D> for GammaControlState
++where
++    D: GlobalDispatch<ZwlrGammaControlManagerV1, GammaControlManagerGlobalData>
++        + Dispatch<ZwlrGammaControlManagerV1, ()>
++        + Dispatch<ZwlrGammaControlV1, GammaControlData>
++        + GammaControlHandler
++        + 'static,
++{
++    fn request(
++        state: &mut D,
++        _client: &Client,
++        _obj: &ZwlrGammaControlManagerV1,
++        request: zwlr_gamma_control_manager_v1::Request,
++        _data: &(),
++        _dh: &DisplayHandle,
++        data_init: &mut DataInit<'_, D>,
++    ) {
++        match request {
++            zwlr_gamma_control_manager_v1::Request::GetGammaControl { id, output } => {
++                let output = Output::from_resource(&output);
++                let size = output
++                    .as_ref()
++                    .and_then(|o| state.gamma_size(o))
++                    .filter(|size| *size > 0);
++                let taken = output.as_ref().is_some_and(|o| {
++                    state.gamma_control_state().active.iter().any(|control| {
++                        control.data::<GammaControlData>().unwrap().output == *o
++                    })
++                });
++
++                let control = data_init.init(
++                    id,
++                    GammaControlData {
++                        output: output.as_ref().map(|o| o.downgrade()).unwrap_or_default(),
++                        size: size.unwrap_or(0),
++                    },
++                );
++
++                match size {
++                    Some(size) if !taken => {
++                        control.gamma_size(size);
++                        state.gamma_control_state().active.push(control);
++                    }
++                    _ => {
++                        debug!(?output, ?size, taken, "Refusing gamma control");
++                        control.failed();
++                    }
++                }
++            }
++            zwlr_gamma_control_manager_v1::Request::Destroy => {}
++            _ => unreachable!(),
++        }
++    }
++}
++
++fn read_ramp(fd: std::os::fd::OwnedFd, size: u32) -> std::io::Result<Vec<u16>> {
++    let file = File::from(fd);
++    let mut bytes = vec![0u8; size as usize * 3 * 2];
++    file.read_exact_at(&mut bytes, 0)?;
++    Ok(bytes
++        .chunks_exact(2)
++        .map(|b| u16::from_ne_bytes([b[0], b[1]]))
++        .collect())
++}
++
++impl<D> Dispatch<ZwlrGammaControlV1, GammaControlData, D> for GammaControlState
++where
++    D: Dispatch<ZwlrGammaControlV1, GammaControlData> + GammaControlHandler + 'static,
++{
++    fn request(
++        state: &mut D,
++        _client: &Client,
++        obj: &ZwlrGammaControlV1,
++        request: zwlr_gamma_control_v1::Request,
++        data: &GammaControlData,
++        _dh: &DisplayHandle,
++        _data_init: &mut DataInit<'_, D>,
++    ) {
++        match request {
++            zwlr_gamma_control_v1::Request::SetGamma { fd } => {
++                if !state.gamma_control_state().active.contains(obj) {
++                    // Already failed; requests on a failed control are ignored.
++                    return;
++                }
++                let Some(output) = data.output.upgrade() else {
++                    obj.failed();
++                    state.gamma_control_state().active.retain(|c| c != obj);
++                    return;
++                };
++                let applied = match read_ramp(fd, data.size) {
++                    Ok(ramp) => state.set_gamma(&output, Some(ramp)),
++                    Err(err) => {
++                        warn!(?err, "Failed to read gamma ramp from client");
++                        false
++                    }
++                };
++                if !applied {
++                    obj.failed();
++                    state.gamma_control_state().active.retain(|c| c != obj);
++                    state.set_gamma(&output, None);
++                }
++            }
++            zwlr_gamma_control_v1::Request::Destroy => {}
++            _ => unreachable!(),
++        }
++    }
++
++    fn destroyed(
++        state: &mut D,
++        _client: ClientId,
++        obj: &ZwlrGammaControlV1,
++        data: &GammaControlData,
++    ) {
++        let gamma_state = state.gamma_control_state();
++        let was_active = gamma_state.active.contains(obj);
++        gamma_state.active.retain(|c| c != obj);
++        if was_active && let Some(output) = data.output.upgrade() {
++            state.set_gamma(&output, None);
++        }
++    }
++}
++
++macro_rules! delegate_gamma_control {
++    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
++        smithay::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
++            smithay::reexports::wayland_protocols_wlr::gamma_control::v1::server::zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1: $crate::wayland::protocols::gamma_control::GammaControlManagerGlobalData
++        ] => $crate::wayland::protocols::gamma_control::GammaControlState);
++        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
++            smithay::reexports::wayland_protocols_wlr::gamma_control::v1::server::zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1: ()
++        ] => $crate::wayland::protocols::gamma_control::GammaControlState);
++        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
++            smithay::reexports::wayland_protocols_wlr::gamma_control::v1::server::zwlr_gamma_control_v1::ZwlrGammaControlV1: $crate::wayland::protocols::gamma_control::GammaControlData
++        ] => $crate::wayland::protocols::gamma_control::GammaControlState);
++    };
++}
++pub(crate) use delegate_gamma_control;
+diff --git a/src/wayland/protocols/mod.rs b/src/wayland/protocols/mod.rs
+index 48aa8337..434a87a2 100644
+--- a/src/wayland/protocols/mod.rs
++++ b/src/wayland/protocols/mod.rs
+@@ -7,6 +7,7 @@ pub mod image_capture_source;
+ pub mod keyboard_layout;
+ pub mod output_configuration;
+ pub mod output_power;
++pub mod gamma_control;
+ pub mod overlap_notify;
+ pub mod session_lock_layer;
+ pub mod toplevel_info;
